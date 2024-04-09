@@ -48,6 +48,30 @@ std::tuple<at::Tensor, at::Tensor> gemm_fused_operand_sum(
   return op.call(a, b, out_mm, out_sum);
 }
 
+std::tuple<at::Tensor, at::Tensor> dual_gemm(
+    const at::Tensor& x,
+    const at::Tensor& w0,
+    const c10::optional<at::Tensor>& b0,
+    const at::Tensor& w1,
+    const c10::optional<at::Tensor>& b1) {
+  static auto op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("xformers::dual_gemm", "")
+          .typed<decltype(dual_gemm)>();
+  return op.call(x, w0, b0, w1, b1);
+}
+std::tuple<at::Tensor> silu_identity_mul_gemm(
+    const at::Tensor& gx,
+    const at::Tensor& ux,
+    const at::Tensor& w3,
+    const c10::optional<at::Tensor>& b3) {
+  static auto op =
+      c10::Dispatcher::singleton()
+          .findSchemaOrThrow("xformers::silu_identity_mul_gemm", "")
+          .typed<decltype(silu_identity_mul_gemm)>();
+  return op.call(gx, ux, w3, b3);
+}
+
 bool shapesMatch(at::Tensor x, std::vector<int64_t> expectedShape) {
   if (x.dim() != int64_t(expectedShape.size())) {
     return false;
@@ -218,11 +242,155 @@ at::Tensor swiglu_packedw_cuda(
         /* ctx */ nullptr, x, w1w2, b1b2, w3, b3);
   }
 }
+
+
+class SwiGLUPackedWeightsNew
+    : public torch::autograd::Function<SwiGLUPackedWeightsNew> {
+ public:
+  static at::Tensor forward(
+      torch::autograd::AutogradContext* ctx,
+      const at::Tensor& x,
+      const at::Tensor& w1w2,
+      const c10::optional<at::Tensor>& b1b2,
+      const at::Tensor w3,
+      const c10::optional<at::Tensor>& b3) {
+    at::AutoDispatchBelowADInplaceOrView g;
+    auto w1 = w1w2[0];
+    auto w2 = w1w2[1];
+    c10::optional<at::Tensor> b1, b2;
+    if (b1b2.has_value()) {
+      b1 = b1b2.value()[0];
+      b2 = b1b2.value()[1];
+    }
+    at::Tensor x1, x2, x5;
+    std::tie(x1, x2) = dual_gemm(x, w1, b1, w2, b2);
+    std::tie(x5) = silu_identity_mul_gemm(x1, x2, w3, b3);
+
+    if (ctx != nullptr) {
+      ctx->save_for_backward({x, w1w2, w3, x1, x2});
+      ctx->saved_data["has_b1b2"] = b1b2.has_value();
+      ctx->saved_data["has_b3"] = b3.has_value();
+    }
+    return x5;
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* ctx,
+      torch::autograd::variable_list grad_outputs) {
+    at::AutoDispatchBelowADInplaceOrView g;
+
+    // Unpack variables
+    auto dx5 = grad_outputs[0];
+    auto saved = ctx->get_saved_variables();
+    auto x = saved[0];
+    auto w1w2 = saved[1];
+    auto w3 = saved[2];
+    auto x1 = saved[3];
+    auto x2 = saved[4];
+    bool has_b1b2 = ctx->saved_data["has_b1b2"].toBool();
+    bool has_b3 = ctx->saved_data["has_b3"].toBool();
+    int64_t B = x.size(0);
+    int64_t H = x2.size(1);
+    int64_t I = x.size(1);
+    int64_t O = dx5.size(1);
+    TORCH_INTERNAL_ASSERT_SHAPE(x1, B, H);
+    TORCH_INTERNAL_ASSERT_SHAPE(x2, B, H);
+    TORCH_INTERNAL_ASSERT_SHAPE(dx5, B, O);
+    TORCH_INTERNAL_ASSERT_SHAPE(w1w2, 2, H, I);
+    TORCH_INTERNAL_ASSERT_SHAPE(w3, O, H);
+
+    // Compute BW
+    at::Tensor dx1dx2, x4;
+    TORCH_INTERNAL_ASSERT(dx5.size(1) == w3.size(0));
+    auto dx4 = torch::mm(dx5, w3);
+    std::tie(dx1dx2, x4) = silu_bw_fused(x1, x2, dx4);
+    TORCH_INTERNAL_ASSERT_SHAPE(dx1dx2, B, 2, H);
+    TORCH_INTERNAL_ASSERT_SHAPE(x4, B, H);
+    x1.reset();
+    x2.reset();
+    dx4.reset();
+
+    at::Tensor db3, dw3;
+
+    if (has_b3) {
+      db3 = torch::empty({O}, w3.options());
+      dw3 = torch::empty({O, H}, w3.options());
+      TORCH_INTERNAL_ASSERT(dx5.size(0) == x4.size(0));
+      gemm_fused_operand_sum(dx5.transpose(-2, -1), x4, dw3, db3);
+    } else {
+      dw3 = torch::mm(dx5.transpose(-2, -1), x4);
+    }
+    x4.reset();
+    dx5.reset();
+
+    TORCH_INTERNAL_ASSERT(dx1dx2.is_contiguous());
+    TORCH_INTERNAL_ASSERT(w1w2.is_contiguous());
+
+    w1w2 = w1w2.view({2 * H, I});
+    dx1dx2 = dx1dx2.view({B, 2 * H});
+    auto dx = torch::mm(dx1dx2, w1w2);
+
+    // backward of linear1 + linear2 - packed
+    at::Tensor dw1dw2, db1db2;
+    if (has_b1b2) {
+      dw1dw2 = torch::empty({2 * H, I}, w1w2.options());
+      db1db2 = torch::empty({2 * H}, w1w2.options());
+      gemm_fused_operand_sum(dx1dx2.transpose(-2, -1), x, dw1dw2, db1db2);
+      db1db2 = db1db2.view({2, H});
+    } else {
+      dw1dw2 = torch::mm(dx1dx2.transpose(-2, -1), x);
+    }
+
+    return {dx, dw1dw2.view({2, H, I}), db1db2, dw3, db3};
+  }
+};
+
+at::Tensor swiglu_packedw_new_autograd(
+    const at::Tensor& x,
+    const at::Tensor& w1w2,
+    const c10::optional<at::Tensor> b1b2,
+    const at::Tensor w3,
+    const c10::optional<at::Tensor> b3) {
+  return SwiGLUPackedWeightsNew::apply(x, w1w2, b1b2, w3, b3);
+}
+
+at::Tensor swiglu_packedw_new_autocast(
+    const at::Tensor& x,
+    const at::Tensor& w1w2,
+    const c10::optional<at::Tensor> b1b2,
+    const at::Tensor w3,
+    const c10::optional<at::Tensor> b3) {
+  c10::impl::ExcludeDispatchKeyGuard no_autocast(c10::DispatchKey::Autocast);
+  auto exec_type = at::autocast::get_autocast_gpu_dtype();
+  return SwiGLUPackedWeightsNew::apply(
+      at::autocast::cached_cast(exec_type, x),
+      at::autocast::cached_cast(exec_type, w1w2),
+      at::autocast::cached_cast(exec_type, b1b2),
+      at::autocast::cached_cast(exec_type, w3),
+      at::autocast::cached_cast(exec_type, b3));
+}
+
+at::Tensor swiglu_packedw_new_cuda(
+    const at::Tensor& x,
+    const at::Tensor& w1w2,
+    const c10::optional<at::Tensor> b1b2,
+    const at::Tensor w3,
+    const c10::optional<at::Tensor> b3) {
+  if (x.requires_grad()) {
+    return SwiGLUPackedWeightsNew::apply(x, w1w2, b1b2, w3, b3);
+  } else {
+    return SwiGLUPackedWeightsNew::forward(
+        /* ctx */ nullptr, x, w1w2, b1b2, w3, b3);
+  }
+}
+
 } // namespace
 
 TORCH_LIBRARY(xformers, m) {
   m.def(
       "swiglu_packedw(Tensor x, Tensor w1w2, Tensor? b1b2, Tensor w3, Tensor? b3) -> Tensor");
+  m.def(
+      "swiglu_packedw_new(Tensor x, Tensor w1w2, Tensor? b1b2, Tensor w3, Tensor? b3) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(xformers, Autograd, m) {
@@ -240,3 +408,20 @@ TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
 TORCH_LIBRARY_IMPL(xformers, Meta, m) {
   m.impl("swiglu_packedw", swiglu_packedw_cuda);
 }
+
+TORCH_LIBRARY_IMPL(xformers, Autograd, m) {
+  m.impl("swiglu_packedw_new", swiglu_packedw_new_autograd);
+}
+
+TORCH_LIBRARY_IMPL(xformers, Autocast, m) {
+  m.impl("swiglu_packedw_new", swiglu_packedw_new_autocast);
+}
+
+TORCH_LIBRARY_IMPL(xformers, CUDA, m) {
+  m.impl("swiglu_packedw_new", swiglu_packedw_new_cuda);
+}
+
+TORCH_LIBRARY_IMPL(xformers, Meta, m) {
+  m.impl("swiglu_packedw_new", swiglu_packedw_new_cuda);
+}
+

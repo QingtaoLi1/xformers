@@ -241,21 +241,21 @@ def rename_cpp_cu(cpp_files):
 
 
 def get_extensions():
-    extensions_dir = os.path.join("xformers", "csrc")
+    extensions_dir = os.path.join("xformers", "csrc", "swiglu")
 
     sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)
     source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)
-    source_hip = glob.glob(
-        os.path.join(extensions_dir, "attention", "hip_fmha", "**", "*.cpp"),
-        recursive=True,
-    )
-    source_hip_generated = glob.glob(
-        os.path.join(extensions_dir, "attention", "hip_fmha", "**", "*.cu"),
-        recursive=True,
-    )
-    # avoid the temporary .cu files generated under xformers/csrc/attention/hip_fmha
-    source_cuda = list(set(source_cuda) - set(source_hip_generated))
-    sources = list(set(sources) - set(source_hip))
+    # source_hip = glob.glob(
+    #     os.path.join(extensions_dir, "attention", "hip_fmha", "**", "*.cpp"),
+    #     recursive=True,
+    # )
+    # source_hip_generated = glob.glob(
+    #     os.path.join(extensions_dir, "attention", "hip_fmha", "**", "*.cu"),
+    #     recursive=True,
+    # )
+    # # avoid the temporary .cu files generated under xformers/csrc/attention/hip_fmha
+    # source_cuda = list(set(source_cuda) - set(source_hip_generated))
+    # sources = list(set(sources) - set(source_hip))
 
     sputnik_dir = os.path.join(this_dir, "third_party", "sputnik")
     cutlass_dir = os.path.join(this_dir, "third_party", "cutlass", "include")
@@ -284,105 +284,54 @@ def get_extensions():
     hip_version = None
     flash_version = "0.0.0"
 
-    if (
-        (torch.cuda.is_available() and ((CUDA_HOME is not None)))
-        or os.getenv("FORCE_CUDA", "0") == "1"
-        or os.getenv("TORCH_CUDA_ARCH_LIST", "") != ""
-    ):
-        cuda_version = get_cuda_version(CUDA_HOME)
-        extension = CUDAExtension
-        sources += source_cuda
-        include_dirs += [sputnik_dir, cutlass_dir, cutlass_examples_dir]
-        nvcc_flags = [
-            "-DHAS_PYTORCH",
-            "--use_fast_math",
-            "-U__CUDA_NO_HALF_OPERATORS__",
-            "-U__CUDA_NO_HALF_CONVERSIONS__",
-            "--extended-lambda",
-            "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
-            "-std=c++17",
-        ] + get_extra_nvcc_flags_for_build_type(cuda_version)
-        if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
-            nvcc_flags.append("-DNDEBUG")
-        nvcc_flags += shlex.split(os.getenv("NVCC_FLAGS", ""))
-        if cuda_version >= 1102:
-            nvcc_flags += [
-                "--threads",
-                "4",
-                "--ptxas-options=-v",
-            ]
-        if sys.platform == "win32":
-            nvcc_flags += [
-                "-Xcompiler",
-                "/Zc:lambda",
-                "-Xcompiler",
-                "/Zc:preprocessor",
-            ]
-        extra_compile_args["nvcc"] = nvcc_flags
-
-        flash_extensions = get_flash_attention_extensions(
-            cuda_version=cuda_version, extra_compile_args=extra_compile_args
-        )
-
-        if flash_extensions:
-            flash_version = get_flash_version()
-        ext_modules += flash_extensions
-
-        # NOTE: This should not be applied to Flash-Attention
-        # see https://github.com/Dao-AILab/flash-attention/issues/359
-        extra_compile_args["nvcc"] += [
-            # Workaround for a regression with nvcc > 11.6
-            # See https://github.com/facebookresearch/xformers/issues/712
-            "--ptxas-options=-O2",
-            "--ptxas-options=-allow-expensive-optimizations=true",
+    assert torch.cuda.is_available() and ((CUDA_HOME is not None))
+    cuda_version = get_cuda_version(CUDA_HOME)
+    extension = CUDAExtension
+    sources += source_cuda
+    include_dirs += [sputnik_dir, cutlass_dir, cutlass_examples_dir]
+    nvcc_flags = [
+        "-DHAS_PYTORCH",
+        "--use_fast_math",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "--extended-lambda",
+        "-D_ENABLE_EXTENDED_ALIGNED_STORAGE",
+        "-std=c++17",
+    ] + get_extra_nvcc_flags_for_build_type(cuda_version)
+    if os.getenv("XFORMERS_ENABLE_DEBUG_ASSERTIONS", "0") != "1":
+        nvcc_flags.append("-DNDEBUG")
+    nvcc_flags += shlex.split(os.getenv("NVCC_FLAGS", ""))
+    if cuda_version >= 1102:
+        nvcc_flags += [
+            "--threads",
+            "4",
+            "--ptxas-options=-v",
         ]
-    elif torch.cuda.is_available() and torch.version.hip:
-        rename_cpp_cu(source_hip)
-        rocm_home = os.getenv("ROCM_PATH")
-        hip_version = get_hip_version(rocm_home)
-
-        source_hip_cu = []
-        for ff in source_hip:
-            source_hip_cu += [ff.replace(".cpp", ".cu")]
-
-        extension = CUDAExtension
-        sources += source_hip_cu
-        include_dirs += [
-            Path(this_dir) / "xformers" / "csrc" / "attention" / "hip_fmha"
+    if sys.platform == "win32":
+        nvcc_flags += [
+            "-Xcompiler",
+            "/Zc:lambda",
+            "-Xcompiler",
+            "/Zc:preprocessor",
         ]
+    extra_compile_args["nvcc"] = nvcc_flags
 
-        include_dirs += [
-            Path(this_dir)
-            / "third_party"
-            / "composable_kernel_tiled"
-            / "example"
-            / "91_tile_program"
-            / "xformers_fmha"
-        ]
+    # flash_extensions = get_flash_attention_extensions(
+    #     cuda_version=cuda_version, extra_compile_args=extra_compile_args
+    # )
 
-        include_dirs += [
-            Path(this_dir) / "third_party" / "composable_kernel_tiled" / "include"
-        ]
+    # if flash_extensions:
+    #     flash_version = get_flash_version()
+    # ext_modules += flash_extensions
 
-        generator_flag = []
-
-        cc_flag = ["-DBUILD_PYTHON_PACKAGE"]
-        extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"] + generator_flag,
-            "nvcc": [
-                "-O3",
-                "-std=c++17",
-                f"--offload-arch={os.getenv('HIP_ARCHITECTURES', 'native')}",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-DCK_FMHA_FWD_FAST_EXP2=1",
-                "-fgpu-flush-denormals-to-zero",
-                "-Werror",
-                "-Woverloaded-virtual",
-            ]
-            + generator_flag
-            + cc_flag,
-        }
+    # NOTE: This should not be applied to Flash-Attention
+    # see https://github.com/Dao-AILab/flash-attention/issues/359
+    extra_compile_args["nvcc"] += [
+        # Workaround for a regression with nvcc > 11.6
+        # See https://github.com/facebookresearch/xformers/issues/712
+        "--ptxas-options=-O2",
+        "--ptxas-options=-allow-expensive-optimizations=true",
+    ]
 
     ext_modules.append(
         extension(
@@ -518,3 +467,4 @@ if __name__ == "__main__":
         ],
         zip_safe=False,
     )
+
