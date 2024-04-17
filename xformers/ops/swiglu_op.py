@@ -270,8 +270,8 @@ class SwiGLUOpDispatch:
             SwiGLUOp: The best operator for the configuration
         """
         priorities: Sequence[SwiGLUOp] = [
-            SwiGLUPackedFusedOp,
             SwiGLUFusedOp,
+            SwiGLUPackedFusedOp,
         ]
         for op in priorities:
             if op.supports(self):
@@ -300,6 +300,22 @@ class SwiGLUOpDispatch:
 
 
 ######## New fusion implementation ########
+swiglu_bwd_codestring = """
+template <typename T> T swiglu_bwd(T x, T y, T g, T& dx, T& dy) {
+    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
+    dx = x_sigmoid * (1 + float(x) * (1.0f - x_sigmoid)) * float(g) * float(y);
+    dy = float(x) * x_sigmoid * float(g);
+}
+"""
+swiglu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_codestring, num_outputs=2)
+
+swiglu_fwd_codestring = """
+template <typename T> T swiglu_fwd(T x, T y) {
+    return float(x) * float(y) / (1.0f + ::exp(-float(x)));
+}
+"""
+swiglu_fwd = torch.cuda.jiterator._create_jit_fn(swiglu_fwd_codestring)
+
 class _SwiGLUFusedFuncNew(torch.autograd.Function):
     NAME = "fused_new.py"
 
@@ -327,15 +343,23 @@ class _SwiGLUFusedFuncNew(torch.autograd.Function):
     @torch.cuda.amp.custom_bwd
     def backward(cls, ctx, dx5):
         x, w1, w2, w3, x1, x2 = ctx.saved_tensors
-        w1w2 = stack_or_none([w1, w2], dim=0)
+        # w1w2 = stack_or_none([w1, w2], dim=0)
+        w1w2 = None
 
         dx4 = dx5 @ w3  # 255us (nn)
-        dx1dx2, x4 = torch.ops.xformers.silu_bw_fused(x1, x2, dx4)
-        dx1, dx2 = dx1dx2.unbind(1)
-        del x1, x2, dx4
+        # dx1dx2, x4 = torch.ops.xformers.silu_bw_fused(x1, x2, dx4)
+        # dx1, dx2 = dx1dx2.unbind(1)
+        # del x1, x2, dx4
+        # dw3, db3 = cls._linear_bw(dx5, x4, bias=ctx.bias[2])
+        # del x4, dx5
 
+        x4 = swiglu_fwd(x1, x2)
         dw3, db3 = cls._linear_bw(dx5, x4, bias=ctx.bias[2])
         del x4, dx5
+        (dx1, dx2) = swiglu_bwd(x1, x2, dx4)
+        del x1, x2, dx4
+        # torch.cuda.memory.empty_cache()
+
         if w1w2 is not None:
             assert dx1dx2.is_contiguous()
             assert w1w2.is_contiguous()
@@ -426,8 +450,8 @@ class SwiGLUOpNewDispatch:
             SwiGLUOpNew: The best operator for the configuration
         """
         priorities: Sequence[SwiGLUOpNew] = [
-            SwiGLUPackedFusedOpNew,
             SwiGLUFusedOpNew,
+            SwiGLUPackedFusedOpNew,
         ]
         for i, op in enumerate(priorities):
             if op.supports(self):
